@@ -73,6 +73,75 @@
 一次**；失败者得到 200 提交后的权威 `roles`（409 `ILLEGAL_TRANSITION`）。
 认证、租户隔离、退役钥拒签（410）、验签回执规则均不改变（坏签名不产生回执）。
 
+## v2 幂等验签契约（可选）
+
+网关在网络抖动后会重发同一条验收请求。`POST /v2/verify` 在保持 v1 完全可用的前提下，
+为**同一租户的同一消息 ID** 提供“一次验签、一份不可变收据”的语义，并保证消息 ID 复用
+**不能**成为绕过密钥轮换的入口。
+
+### 签名内容（协议域绑定）
+
+v2 不再对原始报文直接签名，而是对以下**规范化消息**做 Ed25519 签名（覆盖完整字符串字节）：
+
+```
+coldchain-verify-v2
+tenant=<tenantId>
+key=<keyId>
+message=<messageId>
+sha256=<请求体 SHA-256 的小写十六进制>
+```
+
+协议域、租户、密钥编号、消息 ID、请求体摘要全部入签：换租户、换钥、换消息编号或改动
+任意一个字节都会使签名失效。协议域前缀也使 v2 签名无法拿到 v1（原始请求体）或 PoP
+挑战的验签面上重放。
+
+### 裁决规则（单次数据库事务）
+
+1. 请求头 `X-Tenant-Id`、`X-Key-Id`、`X-Message-Id`、`X-Signature` 缺一不可；
+   签名先于任何数据库读写完成格式校验（非法 → 400 `BAD_SIGNATURE`，**绝不写占位记录**）。
+2. 事务内先取
+   `pg_advisory_xact_lock(hashtext('v2_receipts'), hashtext(tenant || 0x1f || messageId))`
+   串行化同一条消息的“首次 / 重试”裁决；再读既有收据与密钥行。
+3. **首次验签通过**：当前 / 候选 / 退役中钥均可；退役钥签发**新消息**一律 410
+   `KEY_RETIRED`。通过后写入一行不可变收据，唯一约束为
+   `UNIQUE (tenant_id, message_id)`——两个实例同时收到相同请求时，数据库只允许一行落地，
+   落败事务捕获唯一约束冲突后重读赢家行：完全相同 → 返回赢家收据；存在分歧 → 409。
+4. **内容及签名完全相同的重试**：同一 keyId、同一报文摘要、同一签名字节 → 返回**原
+   receiptId**（202），不做任何 UPDATE；**即使该密钥此后已退役也照常返回**（收据在轮换后
+   依然有效）。
+5. **相同消息 ID 携带不同内容或不同密钥**（签名字节不同同理）→ 409 `RECEIPT_CONFLICT`，
+   响应只回显客户端自己发来的 `messageId`，不泄露既有摘要、keyId 或 receiptId。
+6. 重试在得到任何冲突结论前必须先用所持公钥验签通过：无效签名始终得到 400
+   `BAD_SIGNATURE`，因此冲突响应不能被用来探测某消息 ID 是否存在。
+7. **跨租户隔离**：消息 ID 的作用域是租户；不同租户使用相同 ID 互不影响。其他租户的
+   keyId 与未知 keyId 不可区分（404 `KEY_UNKNOWN`）。
+
+失败路径（坏签名、退役钥、冲突、未知钥、413）在插入前抛错或随事务整体回滚，
+**不会留下任何占位收据**。
+
+v2 回执同时出现在管理员的 `GET /v1/tenants/{tenantId}/receipts` 列表中，条目带
+`"version": "v2"` 与 `messageId` 字段（v1 条目为 `"version": "v1"`、`messageId: null`，
+其余字段不变）。
+
+### v2 请求
+
+```http
+POST /v2/verify
+Authorization: Bearer <gateway-token>
+X-Tenant-Id: <tenantId>
+X-Key-Id: <keyId>
+X-Message-Id: <messageId>
+X-Signature: <64 字节无填充 base64url Ed25519 签名，覆盖上面的规范化消息>
+
+<0 .. 1048576 字节原始报文>
+```
+
+- 首次成功 202 → `{"receiptId": "<uuid>"}`；完全相同的重试得到**同一个** receiptId。
+- `messageId` 与 `tenantId` 同样受
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` 约束，非法 → 400 `BAD_REQUEST`。
+- v1（`POST /v1/verify` 对原始请求体验签、每次成功新开收据、退役快照裁决与轮换行为）
+  保持完全兼容，v2 签名在 v1 验签面上无效，反之亦然。
+
 > 过期判定使用数据库中的**共享虚拟时钟**（`now()` + `service_clock` 偏移），
 > 所有 API 实例看到同一时间。只有在设置 `CLOCK_CONTROL_ENABLED=1` 时才暴露
 > 管理接口 `POST /internal/clock/advance|reset`（默认关闭、关闭时 404），
@@ -99,6 +168,7 @@
 | POST | `/v1/tenants/{tenantId}/pop-challenges/{challengeId}/answer` | `keys:manage` | 提交候选私钥签名，登记限时证明（200） |
 | GET | `/v1/tenants/{tenantId}/pop-challenges` | `keys:manage` | 列出挑战/证明状态 |
 | POST | `/v1/verify` | `verify` | 验签并开具回执（202） |
+| POST | `/v2/verify` | `verify` | v2 幂等验签：协议域+租户+密钥+消息 ID+报文摘要入签，同租户同 ID 一份不可变收据（202） |
 | POST | `/internal/clock/advance`、`/internal/clock/reset` | `keys:manage` | **仅验收**：推进/重置共享虚拟时钟（默认 404） |
 | GET | `/healthz` | — | 健康检查 |
 
@@ -191,7 +261,8 @@ X-Signature: <64 字节 Ed25519 签名，无填充 base64url，覆盖原始请�
 | 409 | `POP_PROOF_DUPLICATE` | 同一挑战重复应答 |
 | 409 | `POP_PROOF_CONSUMED` | 证明已被成功提升消费，重放被拒 |
 | 409 | `POP_PROOF_MISMATCH` | 证明绑定的候选/当前钥或代次已变化（附权威 `roles`） |
-| 410 | `KEY_RETIRED` | 读取快照晚于退休提交 |
+| 409 | `RECEIPT_CONFLICT` | v2：同租户同消息 ID 已被**不同内容/密钥/签名**占用（仅回显 `messageId`，不泄露既有内容） |
+| 410 | `KEY_RETIRED` | 读取快照晚于退休提交；v2 下仅拒绝退役钥签发的**新消息**，已接受消息的重试仍返回原收据 |
 | 410 | `POP_CHALLENGE_EXPIRED` / `POP_PROOF_EXPIRED` | 挑战应答前过期 / 证明提升前过期（后者附 `roles`） |
 | 413 | `PAYLOAD_TOO_LARGE` | 报文超过 1048576 字节 |
 

@@ -189,19 +189,29 @@ async def list_keys(tenant_id: str, _: None = Depends(require("keys:manage"))):
 
 @router.get("/tenants/{tenant_id}/receipts")
 async def list_receipts(tenant_id: str, _: None = Depends(require("keys:manage"))):
+    """All receipts for a tenant: legacy v1 receipts and idempotent v2
+    receipts in one timeline. v2 rows additionally carry the message id."""
     _check_ids(tenant_id)
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT receipt_id, key_id, body_size, encode(body_sha256, 'hex') AS sha256, created_at"
-            " FROM receipts WHERE tenant_id = $1 ORDER BY created_at, receipt_id",
+            "SELECT receipt_id, key_id, body_size, encode(body_sha256, 'hex') AS sha256,"
+            " created_at, 'v1' AS version, NULL::text AS message_id"
+            " FROM receipts WHERE tenant_id = $1"
+            " UNION ALL"
+            " SELECT receipt_id, key_id, body_size, encode(body_sha256, 'hex'),"
+            " created_at, 'v2', message_id"
+            " FROM v2_receipts WHERE tenant_id = $1"
+            " ORDER BY created_at, receipt_id",
             tenant_id,
         )
     return {
         "tenantId": tenant_id,
         "receipts": [
             {
+                "version": row["version"],
                 "receiptId": str(row["receipt_id"]),
                 "keyId": row["key_id"],
+                "messageId": row["message_id"],
                 "size": row["body_size"],
                 "sha256": row["sha256"],
                 "createdAt": row["created_at"].isoformat(),

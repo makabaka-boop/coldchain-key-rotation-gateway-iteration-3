@@ -1,8 +1,11 @@
 """Black-box acceptance fixtures: the API under test is reached over HTTP."""
+import asyncio
 import base64
+import hashlib
 import os
 import uuid
 
+import asyncpg
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -11,9 +14,13 @@ BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
 BASE2_URL = os.environ.get("API_BASE2_URL", "http://localhost:8001").rstrip("/")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "dev-gateway-token")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 ADMIN_HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 GATEWAY_HEADERS = {"Authorization": f"Bearer {GATEWAY_TOKEN}"}
+
+# Wire contract for v2 signatures; mirrors app.verify.v2_signed_message.
+V2_DOMAIN = "coldchain-verify-v2"
 
 
 def b64url(data: bytes) -> str:
@@ -44,6 +51,9 @@ class TenantKey:
 
     def sign(self, body: bytes) -> str:
         return b64url(self._private.sign(body))
+
+    def sign_raw(self, message: bytes) -> str:
+        return b64url(self._private.sign(message))
 
 
 @pytest.fixture()
@@ -192,4 +202,68 @@ def submit(client, tenant_id, key_id, signature, body):
             "X-Signature": signature,
         },
     )
+
+
+def v2_canonical(tenant_id, key_id, message_id, body):
+    digest = hashlib.sha256(body).hexdigest()
+    return (
+        V2_DOMAIN.encode()
+        + f"\ntenant={tenant_id}".encode()
+        + f"\nkey={key_id}".encode()
+        + f"\nmessage={message_id}".encode()
+        + f"\nsha256={digest}".encode()
+    )
+
+
+def v2_sign(key, tenant_id, key_id, message_id, body):
+    """Produce a v2 signature header for (key, message id, body)."""
+    return key.sign_raw(v2_canonical(tenant_id, key_id, message_id, body))
+
+
+def submit_v2(client, tenant_id, key_id, message_id, signature, body, base_path="/v2/verify"):
+    return client.post(
+        base_path,
+        content=body,
+        headers={
+            "X-Tenant-Id": tenant_id,
+            "X-Key-Id": key_id,
+            "X-Message-Id": message_id,
+            "X-Signature": signature,
+        },
+    )
+
+
+def receipts_list(admin_client, tenant_id):
+    resp = admin_client.get(f"/v1/tenants/{tenant_id}/receipts")
+    assert resp.status_code == 200, resp.text
+    return resp.json()["receipts"]
+
+
+class DirectDB:
+    """Thin synchronous wrapper over the real Postgres used by the service,
+    so acceptance tests can assert storage-level facts (unique constraint,
+    immutability, no placeholder rows)."""
+
+    def __init__(self, dsn: str):
+        self._loop = asyncio.new_event_loop()
+        self._conn = self._loop.run_until_complete(asyncpg.connect(dsn))
+
+    def scalar(self, sql: str, *args):
+        return self._loop.run_until_complete(self._conn.fetchval(sql, *args))
+
+    def rows(self, sql: str, *args):
+        return self._loop.run_until_complete(self._conn.fetch(sql, *args))
+
+    def close(self):
+        self._loop.run_until_complete(self._conn.close())
+        self._loop.close()
+
+
+@pytest.fixture(scope="session")
+def direct_db():
+    if not DATABASE_URL:
+        pytest.skip("DATABASE_URL not set; direct storage assertions unavailable")
+    db = DirectDB(DATABASE_URL)
+    yield db
+    db.close()
 

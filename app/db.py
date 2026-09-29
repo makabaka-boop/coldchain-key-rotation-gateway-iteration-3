@@ -35,6 +35,25 @@ CREATE TABLE IF NOT EXISTS receipts (
 );
 CREATE INDEX IF NOT EXISTS receipts_by_tenant ON receipts (tenant_id, created_at);
 
+-- v2 idempotent verification receipts. One row per (tenant, message_id):
+-- the unique constraint is the storage-level arbiter when two instances
+-- accept the same first submission concurrently. The stored signature makes
+-- a retry "same content AND same signature" bit-for-bit comparable, and the
+-- row is immutable once inserted (replays never UPDATE it).
+CREATE TABLE IF NOT EXISTS v2_receipts (
+    receipt_id  UUID        PRIMARY KEY,
+    tenant_id   TEXT        NOT NULL,
+    message_id  TEXT        NOT NULL,
+    key_id      TEXT        NOT NULL,
+    body_sha256 BYTEA       NOT NULL CHECK (octet_length(body_sha256) = 32),
+    signature   BYTEA       NOT NULL CHECK (octet_length(signature) = 64),
+    body_size   BIGINT      NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT v2_receipts_one_per_message UNIQUE (tenant_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS v2_receipts_by_tenant
+    ON v2_receipts (tenant_id, created_at);
+
 -- Per-tenant key generation. Only present once a tenant gains a key; the
 -- generation advances whenever the current key changes, binding a
 -- proof-of-possession to the exact current/candidate pair it was made for.

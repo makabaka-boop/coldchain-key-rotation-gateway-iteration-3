@@ -74,6 +74,10 @@ services:
       API_BASE2_URL: http://api:8000
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
       GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      # Lets acceptance tests assert storage-level facts directly: exactly
+      # one row under concurrent first submissions, no placeholder rows on
+      # rejected requests, transaction rollback.
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
     depends_on:
       api:
         condition: service_healthy
