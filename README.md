@@ -78,6 +78,53 @@
 > 管理接口 `POST /internal/clock/advance|reset`（默认关闭、关闭时 404），
 > 仅供确定性验收推进时间。
 
+## v2 验签契约（可选，消息幂等）
+
+网络抖动会让网关重发同一条报文。v1 对原始请求体验签，**每次**有效请求都开具独立回执；
+v2 是一个可选契约：把协议域、租户、密钥编号、消息 ID 与请求体摘要共同纳入签名，
+并让**同租户同消息 ID 只存在一份不可变收据**。不携带版本头（或显式 `X-Verify-Version: 1`）
+的请求与历史行为完全一致。
+
+### 开启与签名内容
+
+请求头增加 `X-Verify-Version: 2` 与 `X-Message-Id: <1..128 字符 [A-Za-z0-9._-]，首字符字母数字>`，
+签名（Ed25519，覆盖下列字符串的 ASCII 字节）为：
+
+```
+coldchain-verify-v2
+tenant=<tenantId>
+key=<keyId>
+message=<messageId>
+body_sha256=<请求体 SHA-256 的小写十六进制>
+```
+
+协议域使 v2 签名无法与 v1 或 PoP 签名混用；tenant/key/message 绑定上下文，使签名不能跨租户、
+跨密钥或挪用到别的消息 ID；body 摘要让签名提交于请求体内容而无需对至多 1 MiB 的报文整体签名。
+
+### 幂等与冲突语义
+
+- **首次**：密钥在用且验签通过 → **202** `{"receiptId", "duplicate": false}`，写入收据
+  （含消息 ID、keyId、报文 SHA-256 与大小），此后不可变。
+- **内容与签名完全相同的重试**：同租户、同消息 ID、同 keyId、同体摘要 → **200**
+  `{"receiptId": <原收据>, "duplicate": true}`，不新增收据；**即使该密钥随后已退役**
+  （retired），既有消息的原样重试仍返回原收据。
+- **相同 ID 携带不同报文或不同密钥** → **409 `MESSAGE_CONFLICT`**（仅回显消息 ID，
+  不泄露既有内容）。轮换密钥不能让旧消息 ID 在新钥下复用——消息 ID 不会成为绕过轮换的入口。
+- **退役钥不得开启新消息**：消息 ID 无既有收据且密钥已 retired → **410 `KEY_RETIRED`**。
+- **无效签名先被拒绝**：验签发生在任何收据读写之前。坏签名（含用 v1 原始体签名冒充 v2）
+  → **400 `BAD_SIGNATURE`**，不写入占位记录，也不会因为 ID 已存在而改报冲突，
+  因此冲突响应与占位均无法被用来探测既有消息。
+
+### 并发正确性
+
+- `v2_receipts` 上的数据库约束 `UNIQUE (tenant_id, message_id)` 是最终仲裁者；租户列在键中，
+  跨租户的相同消息 ID 天然隔离、各自一份收据。
+- 验签与插入在单个事务内完成；两个实例同时收到相同请求时，一个插入成功返回 202，
+  另一个在唯一约束上落败（`ON CONFLICT DO NOTHING`）后读取胜出行，原样请求返回同一 `receiptId`
+  （200），内容不同则返回 409。任何失败路径事务回滚，绝不留下多余收据。
+- 管理员 `GET .../receipts` 同时列出 v1（`"version": 1, "messageId": null`）与
+  v2（`"version": 2, "messageId": ...`）收据。
+
 ## API
 
 认证：`Authorization: Bearer <token>`。令牌缺失或无效 → **401**；令牌有效但越权 → **403**。
@@ -98,7 +145,7 @@
 | POST | `/v1/tenants/{tenantId}/pop-challenges` | `keys:manage` | 为当前候选钥申请一次性挑战（201） |
 | POST | `/v1/tenants/{tenantId}/pop-challenges/{challengeId}/answer` | `keys:manage` | 提交候选私钥签名，登记限时证明（200） |
 | GET | `/v1/tenants/{tenantId}/pop-challenges` | `keys:manage` | 列出挑战/证明状态 |
-| POST | `/v1/verify` | `verify` | 验签并开具回执（202） |
+| POST | `/v1/verify` | `verify` | 验签并开具回执（v1：202；v2：首次 202、原样重试 200、冲突 409） |
 | POST | `/internal/clock/advance`、`/internal/clock/reset` | `keys:manage` | **仅验收**：推进/重置共享虚拟时钟（默认 404） |
 | GET | `/healthz` | — | 健康检查 |
 
@@ -167,12 +214,16 @@ Authorization: Bearer <gateway-token>
 X-Tenant-Id: <tenantId>
 X-Key-Id: <keyId>
 X-Signature: <64 字节 Ed25519 签名，无填充 base64url，覆盖原始请求体字节>
+# 可选：X-Verify-Version: 2 + X-Message-Id: <id>  （见“v2 验签契约”）
 
 <0 .. 1048576 字节原始报文>
 ```
 
-- 202 → `{"receiptId": "<uuid>"}`，回执落库（含报文 SHA-256 与大小）。
-- 三个在用角色（当前 / 候选 / 退役中）均可验签。
+- v1（默认）：202 → `{"receiptId": "<uuid>"}`，回执落库（含报文 SHA-256 与大小）；
+  每次有效请求一份独立回执。
+- v2（`X-Verify-Version: 2`）：签名覆盖规范化消息（协议域/租户/keyId/消息 ID/体摘要）；
+  首次 202、原样重试 200（同一 `receiptId`，`duplicate: true`）、异内容/异密钥 409。
+- 三个在用角色（当前 / 候选 / 退役中）均可验签；v2 的退役钥不能开启新消息。
 
 ### 错误码
 
@@ -191,6 +242,7 @@ X-Signature: <64 字节 Ed25519 签名，无填充 base64url，覆盖原始请�
 | 409 | `POP_PROOF_DUPLICATE` | 同一挑战重复应答 |
 | 409 | `POP_PROOF_CONSUMED` | 证明已被成功提升消费，重放被拒 |
 | 409 | `POP_PROOF_MISMATCH` | 证明绑定的候选/当前钥或代次已变化（附权威 `roles`） |
+| 409 | `MESSAGE_CONFLICT` | v2：同租户同消息 ID 已被不同内容或不同密钥占用（仅回显 `messageId`） |
 | 410 | `KEY_RETIRED` | 读取快照晚于退休提交 |
 | 410 | `POP_CHALLENGE_EXPIRED` / `POP_PROOF_EXPIRED` | 挑战应答前过期 / 证明提升前过期（后者附 `roles`） |
 | 413 | `PAYLOAD_TOO_LARGE` | 报文超过 1048576 字节 |

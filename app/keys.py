@@ -192,15 +192,25 @@ async def list_receipts(tenant_id: str, _: None = Depends(require("keys:manage")
     _check_ids(tenant_id)
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT receipt_id, key_id, body_size, encode(body_sha256, 'hex') AS sha256, created_at"
-            " FROM receipts WHERE tenant_id = $1 ORDER BY created_at, receipt_id",
+            "SELECT receipt_id::text AS receipt_id, key_id, body_size,"
+            " encode(body_sha256, 'hex') AS sha256, created_at,"
+            " 1 AS version, NULL::text AS message_id"
+            " FROM receipts WHERE tenant_id = $1"
+            " UNION ALL"
+            " SELECT receipt_id::text AS receipt_id, key_id, body_size,"
+            " encode(body_sha256, 'hex') AS sha256, created_at,"
+            " 2 AS version, message_id"
+            " FROM v2_receipts WHERE tenant_id = $1"
+            " ORDER BY created_at, receipt_id",
             tenant_id,
         )
     return {
         "tenantId": tenant_id,
         "receipts": [
             {
-                "receiptId": str(row["receipt_id"]),
+                "receiptId": row["receipt_id"],
+                "version": row["version"],
+                "messageId": row["message_id"],
                 "keyId": row["key_id"],
                 "size": row["body_size"],
                 "sha256": row["sha256"],

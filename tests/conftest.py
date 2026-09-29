@@ -1,5 +1,6 @@
 """Black-box acceptance fixtures: the API under test is reached over HTTP."""
 import base64
+import hashlib
 import os
 import uuid
 
@@ -61,6 +62,12 @@ def admin_client2():
 @pytest.fixture()
 def gateway_client():
     with httpx.Client(base_url=BASE_URL, headers=GATEWAY_HEADERS, timeout=30.0) as client:
+        yield client
+
+
+@pytest.fixture()
+def gateway_client2():
+    with httpx.Client(base_url=BASE2_URL, headers=GATEWAY_HEADERS, timeout=30.0) as client:
         yield client
 
 
@@ -189,6 +196,36 @@ def submit(client, tenant_id, key_id, signature, body):
         headers={
             "X-Tenant-Id": tenant_id,
             "X-Key-Id": key_id,
+            "X-Signature": signature,
+        },
+    )
+
+
+# Wire contract for v2 verification signatures; mirrors the canonical message
+# built by the service (domain + tenant + key + message id + body digest).
+def v2_message(tenant_id, key_id, message_id, body):
+    return (
+        f"coldchain-verify-v2\n"
+        f"tenant={tenant_id}\n"
+        f"key={key_id}\n"
+        f"message={message_id}\n"
+        f"body_sha256={hashlib.sha256(body).hexdigest()}"
+    ).encode("ascii")
+
+
+def v2_sign(key, tenant_id, key_id, message_id, body) -> str:
+    return key.sign(v2_message(tenant_id, key_id, message_id, body))
+
+
+def submit_v2(client, tenant_id, key_id, message_id, signature, body):
+    return client.post(
+        "/v1/verify",
+        content=body,
+        headers={
+            "X-Verify-Version": "2",
+            "X-Tenant-Id": tenant_id,
+            "X-Key-Id": key_id,
+            "X-Message-Id": message_id,
             "X-Signature": signature,
         },
     )

@@ -74,6 +74,8 @@ services:
       API_BASE2_URL: http://api:8000
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
       GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      # Real-database checks (unique-constraint backstop) connect directly.
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
     depends_on:
       api:
         condition: service_healthy
